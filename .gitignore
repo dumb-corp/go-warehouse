@@ -1,0 +1,50 @@
+# OS / editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment / secrets
+.env
+.env.*
+.env/
+*.env
+
+# Python virtualenvs and caches
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Go build and test artifacts
+bin/
+dist/
+coverage.out
+coverage.html
+*.exe
+*.test
+*.out
+
+golangci-lint-report.xml
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Local uploads / generated data
+uploads/
+storage/
+data/
+
+# PDFs and local docs (optional)
+*.pdf
+
+# Local config files
+*.local
