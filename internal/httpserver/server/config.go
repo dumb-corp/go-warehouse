@@ -3,17 +3,20 @@ package core_http_server
 import (
 	"fmt"
 	"time"
+
+	"github.com/kelseyhightower/envconfig"
 )
 
 type Config struct {
-	Addr            string        `envconfig:"ADDR" required:"true"`
+	Host            string        `envconfig:"HOST" default:"localhost"`
+	Port            int           `enveconfig:"PORT" default:":5432"`
 	ShutdownTimeout time.Duration `envconfig:"SHUTDOWN_TIMEOUT" required:"true"`
 }
 
-func NewConfig() Config, error {
+func NewConfig() (Config, error) {
 	var config Config
 
-	if err := envconfig.Porcess("HTTP", &config); err != nil {
+	if err := envconfig.Process("HTTP", &config); err != nil {
 		return Config{}, fmt.Errorf("process envconfig: %w", err)
 	}
 
