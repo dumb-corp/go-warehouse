@@ -33,6 +33,16 @@ type RobotRequest struct {
 	NextCheckpoint string       `json:"next_checkpoint"`
 }
 
+type ScanOut struct {
+	RobotID   string    `json:"robot_id"`
+	ProductID string    `json:"product_id"`
+	Name      string    `json:"product_name"`
+	Quantity  int       `json:"quantity"`
+	Zone      string    `json:"zone"`
+	Status    string    `json:"status"`
+	ScannedAt time.Time `json:"scanned_at"`
+}
+
 func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req RobotRequest
@@ -89,6 +99,39 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
+func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rows, err := pool.Query(r.Context(), `SELECT h.robot_id, h.product_id, p.name, h.quantity, h.zone, COALESCE(h.status, ''), h.scanned_at
+		FROM inventory_history h JOIN products p ON p.id = h.product_id ORDER BY h.scanned_at DESC LIMIT 20`)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "dashboard select error: %v", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		scans := []ScanOut{}
+		for rows.Next() {
+			var s ScanOut
+			if err := rows.Scan(
+				&s.RobotID,
+				&s.ProductID,
+				&s.Name,
+				&s.Quantity,
+				&s.Zone,
+				&s.Status,
+				&s.ScannedAt); err != nil {
+				fmt.Fprintf(os.Stderr, "scan error: %v", err)
+				http.Error(w, "db error", http.StatusInternalServerError)
+				return
+			}
+			scans = append(scans, s)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"recent_scans": scans})
+	}
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -111,6 +154,7 @@ func main() {
 	})
 
 	http.HandleFunc("POST /api/robots/data", robotsDataHandler(pool))
+	http.HandleFunc("GET /api/dashboard/current", dashboardCurrentHandler(pool))
 
 	http.ListenAndServe("localhost:3030", nil)
 }
