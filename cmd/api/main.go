@@ -1,24 +1,34 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 	"os"
 
-	core_logger "go-wharehouse/internal/core/logger"
-	robots_transport_http "go-wharehouse/internal/features/transport/http"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
-	fmt.Println("Hello, I'm wharehouse")
-	logger, err := core_logger.NewLogger(core_logger.NewConfigMust)
+	ctx := context.Background()
+
+	connString := fmt.Sprintf("postgres://%v:%v@localhost:5432/%v", os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_PASSWORD"), os.Getenv("POSTGRES_DB"))
+	pool, err := pgxpool.New(ctx, connString)
 	if err != nil {
-		fmt.Println("failed to init app logger:", err)
+		fmt.Fprintf(os.Stderr, "Unable to connect databse: %v\n", err)
 		os.Exit(1)
 	}
-	defer logger.Close()
 
-	logger.Debug("starting app")
+	if err := pool.Ping(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Ping database error: %v\n", err)
+		os.Exit(1)
+	} else {
+		fmt.Println("database connected successfully")
+	}
 
-	robotsTransportHTTP := robots_transport_http.NewUserHTTPHandler(nil)
-	robotsRoutes := 
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "Hello, world!")
+	})
+
+	http.ListenAndServe("localhost:3030", nil)
 }
