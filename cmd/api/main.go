@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type Location struct {
@@ -41,6 +44,65 @@ type ScanOut struct {
 	Zone      string    `json:"zone"`
 	Status    string    `json:"status"`
 	ScannedAt time.Time `json:"scanned_at"`
+}
+
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type UserResponse struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+	Role string `json:"role"`
+}
+
+func loginHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req LoginRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			fmt.Fprintf(os.Stderr, "json error in login: %v", err)
+			http.Error(w, "invaild json", http.StatusBadRequest)
+			return
+		}
+
+		if req.Email == "" || req.Password == "" { //TODO: придумать проверку покруче
+			http.Error(w, "email and password are required", http.StatusBadRequest)
+			return
+		}
+
+		var user UserResponse
+		var hash string
+		err := pool.QueryRow(r.Context(),
+			`SELECT id, name, role, password_hash FROM users WHERE email = $1`,
+			req.Email).Scan(&user.ID, &user.Name, &user.Role, &hash)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				http.Error(w, "invalid credentials", http.StatusUnauthorized)
+				return
+			}
+			fmt.Fprintf(os.Stderr, "login query failed: %v", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+
+		if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"user": user})
+	}
+}
+
+func generateHashFromPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", fmt.Errorf("generate has error: %v", err)
+	}
+
+	return string(hash), nil
 }
 
 func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
@@ -132,7 +194,24 @@ func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
+func newUser(ctx context.Context, pool *pgxpool.Pool) error {
+	name := "ivan"
+	email := "ivan@example.com"
+	password_hash, err := generateHashFromPassword("12345")
+	if err != nil {
+		return fmt.Errorf("generate hash for user: %v", err)
+	}
+	role := "dev"
+
+	if _, err = pool.Exec(ctx, `INSERT INTO users (email, password_hash, name, role) VALUES ($1, $2, $3, $4)`, email, password_hash, name, role); err != nil {
+		return fmt.Errorf("insert new user into db: %v", err)
+	}
+
+	return nil
+}
+
 func main() {
+
 	ctx := context.Background()
 
 	connString := fmt.Sprintf("postgres://%v:%v@localhost:5432/%v", os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_PASSWORD"), os.Getenv("POSTGRES_DB"))
@@ -149,12 +228,20 @@ func main() {
 		fmt.Println("database connected successfully")
 	}
 
+	if err = newUser(ctx, pool); err != nil {
+		fmt.Fprintf(os.Stderr, "create new user: %v", err)
+		os.Exit(1)
+	} else {
+		fmt.Println("user created successfully")
+	}
+
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "Hello, world!")
 	})
 
 	http.HandleFunc("POST /api/robots/data", robotsDataHandler(pool))
 	http.HandleFunc("GET /api/dashboard/current", dashboardCurrentHandler(pool))
+	http.HandleFunc("POST /api/auth/login", loginHandler(pool))
 
 	http.ListenAndServe("localhost:3030", nil)
 }
