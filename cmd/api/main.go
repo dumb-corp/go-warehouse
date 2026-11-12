@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
@@ -57,7 +59,55 @@ type UserResponse struct {
 	Role string `json:"role"`
 }
 
-func loginHandler(pool *pgxpool.Pool) http.HandlerFunc {
+type ctxKey string
+
+const claimsKey ctxKey = "claims"
+
+type Claims struct {
+	UserID int    `json:"user_id"`
+	Role   string `json:"role"`
+	jwt.RegisteredClaims
+}
+
+func authMiddleware(secret []byte, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenStr, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !found || tokenStr == "" {
+			http.Error(w, "missing or invalid authorization header", http.StatusUnauthorized)
+			return
+		}
+
+		claims := &Claims{}
+		token, err := jwt.ParseWithClaims(tokenStr, claims,
+			func(t *jwt.Token) (any, error) { return secret, nil },
+			jwt.WithValidMethods([]string{"HS256"}),
+		)
+		if err != nil || !token.Valid {
+			fmt.Fprintf(os.Stderr, "invalid or expired token: %v\n", err)
+			http.Error(w, "invalid or expired token", http.StatusUnauthorized)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), claimsKey, claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func generateToken(user UserResponse, secret []byte) (string, error) {
+	now := time.Now()
+	claims := Claims{
+		UserID: user.ID,
+		Role:   user.Role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(24 * time.Hour)),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(secret)
+}
+
+func loginHandler(pool *pgxpool.Pool, jwtSecret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req LoginRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -86,13 +136,15 @@ func loginHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			return
 		}
 
-		if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
-			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		token, err := generateToken(user, []byte(jwtSecret))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "token generation failed: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"user": user})
+		json.NewEncoder(w).Encode(map[string]any{"token": token, "user": user})
 	}
 }
 
@@ -214,6 +266,7 @@ func main() {
 
 	ctx := context.Background()
 
+	jwtSecret := os.Getenv("JWT_SECRET")
 	connString := fmt.Sprintf("postgres://%v:%v@localhost:5432/%v", os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_PASSWORD"), os.Getenv("POSTGRES_DB"))
 	pool, err := pgxpool.New(ctx, connString)
 	if err != nil {
@@ -229,8 +282,7 @@ func main() {
 	}
 
 	if err = newUser(ctx, pool); err != nil {
-		fmt.Fprintf(os.Stderr, "create new user: %v", err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "create new user: %v\n", err)
 	} else {
 		fmt.Println("user created successfully")
 	}
@@ -240,8 +292,9 @@ func main() {
 	})
 
 	http.HandleFunc("POST /api/robots/data", robotsDataHandler(pool))
-	http.HandleFunc("GET /api/dashboard/current", dashboardCurrentHandler(pool))
-	http.HandleFunc("POST /api/auth/login", loginHandler(pool))
+	http.Handle("GET /api/dashboard/current",
+		authMiddleware([]byte(jwtSecret), http.HandlerFunc(dashboardCurrentHandler(pool))))
+	http.HandleFunc("POST /api/auth/login", loginHandler(pool, jwtSecret))
 
 	http.ListenAndServe("localhost:3030", nil)
 }
