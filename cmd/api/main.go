@@ -31,7 +31,7 @@ type ScanResult struct {
 
 type RobotRequest struct {
 	ID             string       `json:"robot_id"`
-	Timestamp      string       `json:"timestamp"`
+	LastUpdate     time.Time    `json:"timestamp"`
 	Location       Location     `json:"location"`
 	ScanResults    []ScanResult `json:"scan_results"`
 	BatteryLevel   int          `json:"battery_level"`
@@ -39,12 +39,9 @@ type RobotRequest struct {
 }
 
 type RobotScanOut struct {
-	ID           string       `json:"robot_id"`
-	Timestamp    string       `json:"timestamp"`
-	Location     Location     `json:"location"`
-	ScanResults  []ScanResult `json:"scan_results"`
-	BatteryLevel int          `json:"battery_level"`
-	Status       string       `json:"status"`
+	RobotRequest
+	LastUpdate time.Time `json:"last_update"`
+	Status     string    `json:"status"`
 }
 
 type ScanOut struct {
@@ -120,7 +117,7 @@ func loginHandler(pool *pgxpool.Pool, jwtSecret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req LoginRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			fmt.Fprintf(os.Stderr, "json error in login: %v", err)
+			fmt.Fprintf(os.Stderr, "json error in login: %v\n", err)
 			http.Error(w, "invaild json", http.StatusBadRequest)
 			return
 		}
@@ -140,14 +137,14 @@ func loginHandler(pool *pgxpool.Pool, jwtSecret string) http.HandlerFunc {
 				http.Error(w, "invalid credentials", http.StatusUnauthorized)
 				return
 			}
-			fmt.Fprintf(os.Stderr, "login query failed: %v", err)
+			fmt.Fprintf(os.Stderr, "login query failed: %v\n", err)
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
 		}
 
 		token, err := generateToken(user, []byte(jwtSecret))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "token generation failed: %v", err)
+			fmt.Fprintf(os.Stderr, "token generation failed: %v\n", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
@@ -170,12 +167,8 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req RobotRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			fmt.Printf("json decode error: %v", err)
+			fmt.Printf("json decode error: %v\n", err)
 			http.Error(w, "error json data", http.StatusBadRequest)
-		}
-		t, err := time.Parse(time.RFC3339, req.Timestamp)
-		if err != nil {
-			t = time.Now() //TODO: придумать что делать, если формат времени не совпадает с нужным
 		}
 
 		ctx := r.Context()
@@ -186,9 +179,9 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			robotStatus = "off"
 		}
 
-		_, err = pool.Exec(ctx, `
+		_, err := pool.Exec(ctx, `
 		INSERT INTO robots (id, status, battery_level, last_update, current_zone, current_row, current_shelf) VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (id) DO NOTHING;`, req.ID, robotStatus, req.BatteryLevel, t, req.Location.Zone, req.Location.Row, req.Location.Shelf)
+		ON CONFLICT (id) DO NOTHING;`, req.ID, robotStatus, req.BatteryLevel, req.LastUpdate, req.Location.Zone, req.Location.Row, req.Location.Shelf)
 
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "robot insert error: %v\n", err)
@@ -208,7 +201,7 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			_, err := pool.Exec(ctx, `
 			INSERT INTO inventory_history 
 			(robot_id, product_id, quantity, zone, row_number, shelf_number, status, scanned_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-				req.ID, s.ID, s.Quantity, req.Location.Zone, req.Location.Row, req.Location.Shelf, s.Status, t)
+				req.ID, s.ID, s.Quantity, req.Location.Zone, req.Location.Row, req.Location.Shelf, s.Status, req.LastUpdate)
 
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "iventory_history insert error: %v\n", err)
@@ -224,19 +217,19 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 
 func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		rows, err := pool.Query(r.Context(), `SELECT h.robot_id, h.product_id, p.name, h.quantity, h.zone, COALESCE(h.status, ''), h.scanned_at
+		scanRows, err := pool.Query(r.Context(), `SELECT h.robot_id, h.product_id, p.name, h.quantity, h.zone, COALESCE(h.status, ''), h.scanned_at
 		FROM inventory_history h JOIN products p ON p.id = h.product_id ORDER BY h.scanned_at DESC LIMIT 20`)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "dashboard select error: %v", err)
+			fmt.Fprintf(os.Stderr, "dashboard select error: %v\n", err)
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
 		}
-		defer rows.Close()
+		defer scanRows.Close()
 
 		scans := []ScanOut{}
-		for rows.Next() {
+		for scanRows.Next() {
 			var s ScanOut
-			if err := rows.Scan(
+			if err := scanRows.Scan(
 				&s.RobotID,
 				&s.ProductID,
 				&s.Name,
@@ -244,7 +237,7 @@ func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 				&s.Zone,
 				&s.Status,
 				&s.ScannedAt); err != nil {
-				fmt.Fprintf(os.Stderr, "scan error: %v", err)
+				fmt.Fprintf(os.Stderr, "scan error: %v\n", err)
 				http.Error(w, "db error", http.StatusInternalServerError)
 				return
 			}
@@ -252,22 +245,29 @@ func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		}
 
 		robots := []RobotScanOut{}
-		rows, err = pool.Query(r.Context(), `SELECT * FROM robots`) //TODO: надо перечислить нужные колонки явно
+		robotRows, err := pool.Query(r.Context(),
+			`SELECT id,
+				CASE
+					WHEN last_update IS NULL OR last_update < NOW() - INTERVAL '60 seconds' THEN 'offline'
+					WHEN battery_level < 20 THEN 'low_battery'
+					ELSE 'active'
+				END AS status,
+				battery_level, last_update, current_zone, current_row, current_shelf
+			FROM robots`)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "dashboard select error: %v", err)
+			fmt.Fprintf(os.Stderr, "dashboard select error: %v\n", err)
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
 		}
-		defer rows.Close()
+		defer robotRows.Close()
 
-		for rows.Next() {
+		for robotRows.Next() {
 			var robot RobotScanOut
-			var timeStamp time.Time
-			if err := rows.Scan(
+			if err := robotRows.Scan(
 				&robot.ID,
-				&robot.Status, //TODO: прочекать актуальность статусов
+				&robot.Status,
 				&robot.BatteryLevel,
-				&timeStamp,
+				&robot.LastUpdate,
 				&robot.Location.Zone,
 				&robot.Location.Row,
 				&robot.Location.Shelf,
@@ -276,16 +276,20 @@ func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 				http.Error(w, "db error", http.StatusInternalServerError)
 				return
 			}
-			robot.Timestamp = timeStamp.String()
 			robots = append(robots, robot)
 		}
+		var scansToday int
+		err = pool.QueryRow(r.Context(),
+			`SELECT COUNT(*) FROM inventory_history WHERE scanned_at >= CURRENT_DATE`,
+		).Scan(&scansToday)
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"robots":       robots,
 			"recent_scans": scans,
 			"statistics": map[string]int{ //TODO: расширить статистики
 				"robot_count": len(robots),
-				"scans_count": len(scans),
+				"scans_count": scansToday,
 			}})
 	}
 }
