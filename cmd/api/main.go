@@ -38,6 +38,15 @@ type RobotRequest struct {
 	NextCheckpoint string       `json:"next_checkpoint"`
 }
 
+type RobotScanOut struct {
+	ID           string       `json:"robot_id"`
+	Timestamp    string       `json:"timestamp"`
+	Location     Location     `json:"location"`
+	ScanResults  []ScanResult `json:"scan_results"`
+	BatteryLevel int          `json:"battery_level"`
+	Status       string       `json:"status"`
+}
+
 type ScanOut struct {
 	RobotID   string    `json:"robot_id"`
 	ProductID string    `json:"product_id"`
@@ -241,8 +250,43 @@ func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			}
 			scans = append(scans, s)
 		}
+
+		robots := []RobotScanOut{}
+		rows, err = pool.Query(r.Context(), `SELECT * FROM robots`) //TODO: надо перечислить нужные колонки явно
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "dashboard select error: %v", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var robot RobotScanOut
+			var timeStamp time.Time
+			if err := rows.Scan(
+				&robot.ID,
+				&robot.Status, //TODO: прочекать актуальность статусов
+				&robot.BatteryLevel,
+				&timeStamp,
+				&robot.Location.Zone,
+				&robot.Location.Row,
+				&robot.Location.Shelf,
+			); err != nil {
+				fmt.Fprintf(os.Stderr, "scan error: %v", err)
+				http.Error(w, "db error", http.StatusInternalServerError)
+				return
+			}
+			robot.Timestamp = timeStamp.String()
+			robots = append(robots, robot)
+		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"recent_scans": scans})
+		json.NewEncoder(w).Encode(map[string]any{
+			"robots":       robots,
+			"recent_scans": scans,
+			"statistics": map[string]int{ //TODO: расширить статистики
+				"robot_count": len(robots),
+				"scans_count": len(scans),
+			}})
 	}
 }
 
