@@ -34,14 +34,16 @@ type RobotRequest struct {
 	LastUpdate     time.Time    `json:"timestamp"`
 	Location       Location     `json:"location"`
 	ScanResults    []ScanResult `json:"scan_results"`
-	BatteryLevel   int          `json:"battery_level"`
+	BatteryLevel   float32      `json:"battery_level"`
 	NextCheckpoint string       `json:"next_checkpoint"`
 }
 
-type RobotScanOut struct {
-	RobotRequest
-	LastUpdate time.Time `json:"last_update"`
-	Status     string    `json:"status"`
+type RobotDashboard struct {
+	ID           string    `json:"robot_id"`
+	LastUpdate   time.Time `json:"last_update"`
+	Location     Location  `json:"location"`
+	BatteryLevel float32   `json:"battery_level"`
+	Status       string    `json:"status"`
 }
 
 type ScanOut struct {
@@ -163,6 +165,16 @@ func generateHashFromPassword(password string) (string, error) {
 	return string(hash), nil
 }
 
+func checkRobotStatus(last_update time.Time, battery_level float32) string {
+	if time.Since(last_update) > 60*time.Second {
+		return "offline"
+	}
+	if battery_level < 20 {
+		return "low battery"
+	}
+	return "active"
+}
+
 func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req RobotRequest
@@ -171,17 +183,18 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			http.Error(w, "error json data", http.StatusBadRequest)
 		}
 
-		ctx := r.Context()
-		robotStatus := ""
-		if len(req.ScanResults) > 0 {
-			robotStatus = "active"
-		} else {
-			robotStatus = "off"
+		if req.LastUpdate.IsZero() {
+			req.LastUpdate = time.Now().UTC()
 		}
+
+		ctx := r.Context()
+
+		robotStatus := checkRobotStatus(req.LastUpdate, req.BatteryLevel)
 
 		_, err := pool.Exec(ctx, `
 		INSERT INTO robots (id, status, battery_level, last_update, current_zone, current_row, current_shelf) VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (id) DO NOTHING;`, req.ID, robotStatus, req.BatteryLevel, req.LastUpdate, req.Location.Zone, req.Location.Row, req.Location.Shelf)
+		ON CONFLICT (id) DO UPDATE
+		SET last_update = NOW();`, req.ID, robotStatus, req.BatteryLevel, req.LastUpdate, req.Location.Zone, req.Location.Row, req.Location.Shelf)
 
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "robot insert error: %v\n", err)
@@ -237,22 +250,16 @@ func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 				&s.Zone,
 				&s.Status,
 				&s.ScannedAt); err != nil {
-				fmt.Fprintf(os.Stderr, "scan error: %v\n", err)
+				fmt.Fprintf(os.Stderr, "history scan error: %v\n", err)
 				http.Error(w, "db error", http.StatusInternalServerError)
 				return
 			}
 			scans = append(scans, s)
 		}
 
-		robots := []RobotScanOut{}
+		robots := []RobotDashboard{}
 		robotRows, err := pool.Query(r.Context(),
-			`SELECT id,
-				CASE
-					WHEN last_update IS NULL OR last_update < NOW() - INTERVAL '60 seconds' THEN 'offline'
-					WHEN battery_level < 20 THEN 'low_battery'
-					ELSE 'active'
-				END AS status,
-				battery_level, last_update, current_zone, current_row, current_shelf
+			`SELECT id, battery_level, last_update, current_zone, current_row, current_shelf 
 			FROM robots`)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "dashboard select error: %v\n", err)
@@ -262,20 +269,20 @@ func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		defer robotRows.Close()
 
 		for robotRows.Next() {
-			var robot RobotScanOut
+			var robot RobotDashboard
 			if err := robotRows.Scan(
 				&robot.ID,
-				&robot.Status,
 				&robot.BatteryLevel,
 				&robot.LastUpdate,
 				&robot.Location.Zone,
 				&robot.Location.Row,
 				&robot.Location.Shelf,
 			); err != nil {
-				fmt.Fprintf(os.Stderr, "scan error: %v", err)
+				fmt.Fprintf(os.Stderr, "robot scan error: %v", err)
 				http.Error(w, "db error", http.StatusInternalServerError)
 				return
 			}
+			robot.Status = checkRobotStatus(robot.LastUpdate, robot.BatteryLevel)
 			robots = append(robots, robot)
 		}
 		var scansToday int
