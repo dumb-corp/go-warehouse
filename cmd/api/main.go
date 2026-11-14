@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -144,6 +145,11 @@ func loginHandler(pool *pgxpool.Pool, jwtSecret string) http.HandlerFunc {
 			return
 		}
 
+		if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+
 		token, err := generateToken(user, []byte(jwtSecret))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "token generation failed: %v\n", err)
@@ -201,6 +207,16 @@ func validateRobotRequest(req RobotRequest) error {
 	return nil
 }
 
+func checkRobotToken(r *http.Request, robotID string) bool {
+	got, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !found {
+		return false
+	}
+
+	want := "robot_token_" + robotID
+	return subtle.ConstantTimeCompare([]byte(want), []byte(got)) == 1
+}
+
 func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -209,6 +225,11 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			fmt.Fprintf(os.Stderr, "json decode error: %v\n", err)
 			http.Error(w, "error json data", http.StatusBadRequest)
+			return
+		}
+
+		if !checkRobotToken(r, req.ID) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 
@@ -222,7 +243,7 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		}
 		req.LastUpdate = req.LastUpdate.UTC()
 
-		robotStatus := checkRobotStatus(req.LastUpdate, req.BatteryLevel)
+		robotStatus := checkRobotStatus(time.Now().UTC(), req.BatteryLevel)
 
 		ctx := r.Context()
 		tx, err := pool.Begin(r.Context())
@@ -278,8 +299,11 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			return
 		}
 
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]string{"status": "received"})
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":     "received",
+			"message_id": fmt.Sprintf("%s-%d", req.ID, time.Now().UnixNano()),
+		})
 	}
 }
 
@@ -311,7 +335,11 @@ func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			}
 			scans = append(scans, s)
 		}
-		//TODO: проверка rows.Err()
+		if err := scanRows.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "interating scans error: %v\n", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
 
 		robots := []RobotDashboard{}
 		robotRows, err := pool.Query(r.Context(),
@@ -341,12 +369,20 @@ func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			robot.Status = checkRobotStatus(robot.LastUpdate, robot.BatteryLevel)
 			robots = append(robots, robot)
 		}
-		//TODO: проверка rows.Err()
+		if err := robotRows.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "interating robots error: %v\n", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
 
 		var scansToday int
-		err = pool.QueryRow(r.Context(),
+		if err = pool.QueryRow(r.Context(),
 			`SELECT COUNT(*) FROM inventory_history WHERE scanned_at >= CURRENT_DATE`,
-		).Scan(&scansToday)
+		).Scan(&scansToday); err != nil {
+			fmt.Fprintf(os.Stderr, "count scans error: %v\n", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -360,16 +396,19 @@ func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 }
 
 func newUser(ctx context.Context, pool *pgxpool.Pool) error {
-	name := "ivan"
-	email := "ivan@example.com"
-	password_hash, err := generateHashFromPassword("12345")
+	name := "admin"
+	email := "admin@example.com"
+	password_hash, err := generateHashFromPassword("admin12345")
 	if err != nil {
-		return fmt.Errorf("generate hash for user: %v", err)
+		return fmt.Errorf("generate hash for user: %v\n", err)
 	}
-	role := "dev"
+	role := "admin"
 
-	if _, err = pool.Exec(ctx, `INSERT INTO users (email, password_hash, name, role) VALUES ($1, $2, $3, $4)`, email, password_hash, name, role); err != nil {
-		return fmt.Errorf("insert new user into db: %v", err)
+	if _, err = pool.Exec(ctx, `
+		INSERT INTO users (email, password_hash, name, role) 
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (email) DO NOTHING;`, email, password_hash, name, role); err != nil {
+		return fmt.Errorf("insert new user into db: %v\n", err)
 	}
 
 	return nil
@@ -380,6 +419,11 @@ func main() {
 	ctx := context.Background()
 
 	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		fmt.Fprint(os.Stderr, "JWT_SECRET is required")
+		os.Exit(1)
+	}
+
 	connString := fmt.Sprintf("postgres://%v:%v@localhost:5432/%v", os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_PASSWORD"), os.Getenv("POSTGRES_DB"))
 	pool, err := pgxpool.New(ctx, connString)
 	if err != nil {
