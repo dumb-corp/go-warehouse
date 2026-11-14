@@ -177,6 +177,14 @@ func checkRobotStatus(last_update time.Time, battery_level float32) string {
 
 func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		tx, err := pool.Begin(r.Context())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create transaction error: %v\n", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		defer tx.Rollback(r.Context())
+
 		var req RobotRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			fmt.Printf("json decode error: %v\n", err)
@@ -191,7 +199,7 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 
 		robotStatus := checkRobotStatus(req.LastUpdate, req.BatteryLevel)
 
-		_, err := pool.Exec(ctx, `
+		_, err = tx.Exec(ctx, `
 		INSERT INTO robots (id, status, battery_level, last_update, current_zone, current_row, current_shelf) VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (id) DO UPDATE
 		SET last_update = NOW();`, req.ID, robotStatus, req.BatteryLevel, req.LastUpdate, req.Location.Zone, req.Location.Row, req.Location.Shelf)
@@ -202,7 +210,7 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			return
 		}
 		for _, s := range req.ScanResults {
-			_, err = pool.Exec(ctx, `INSERT INTO products (id, name) VALUES ($1, $2)
+			_, err = tx.Exec(ctx, `INSERT INTO products (id, name) VALUES ($1, $2)
 			ON CONFLICT (id) DO NOTHING`, s.ID, s.Name)
 
 			if err != nil {
@@ -211,7 +219,7 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 				return
 			}
 
-			_, err := pool.Exec(ctx, `
+			_, err := tx.Exec(ctx, `
 			INSERT INTO inventory_history 
 			(robot_id, product_id, quantity, zone, row_number, shelf_number, status, scanned_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 				req.ID, s.ID, s.Quantity, req.Location.Zone, req.Location.Row, req.Location.Shelf, s.Status, req.LastUpdate)
@@ -221,6 +229,11 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 				http.Error(w, "db error", http.StatusInternalServerError)
 				return
 			}
+		}
+
+		if err := tx.Commit(r.Context()); err != nil {
+			fmt.Fprintf(os.Stderr, "commit transaction error: %v\n", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
 		}
 
 		w.WriteHeader(http.StatusCreated)
@@ -256,6 +269,7 @@ func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			}
 			scans = append(scans, s)
 		}
+		//TODO: проверка rows.Err()
 
 		robots := []RobotDashboard{}
 		robotRows, err := pool.Query(r.Context(),
@@ -278,13 +292,15 @@ func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 				&robot.Location.Row,
 				&robot.Location.Shelf,
 			); err != nil {
-				fmt.Fprintf(os.Stderr, "robot scan error: %v", err)
+				fmt.Fprintf(os.Stderr, "robot scan error: %v\n", err)
 				http.Error(w, "db error", http.StatusInternalServerError)
 				return
 			}
 			robot.Status = checkRobotStatus(robot.LastUpdate, robot.BatteryLevel)
 			robots = append(robots, robot)
 		}
+		//TODO: проверка rows.Err()
+
 		var scansToday int
 		err = pool.QueryRow(r.Context(),
 			`SELECT COUNT(*) FROM inventory_history WHERE scanned_at >= CURRENT_DATE`,
