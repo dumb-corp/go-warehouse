@@ -3,12 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type Location struct {
@@ -26,36 +31,219 @@ type ScanResult struct {
 
 type RobotRequest struct {
 	ID             string       `json:"robot_id"`
-	Timestamp      string       `json:"timestamp"`
+	LastUpdate     time.Time    `json:"timestamp"`
 	Location       Location     `json:"location"`
 	ScanResults    []ScanResult `json:"scan_results"`
-	BatteryLevel   int          `json:"battery_level"`
+	BatteryLevel   float32      `json:"battery_level"`
 	NextCheckpoint string       `json:"next_checkpoint"`
+}
+
+type RobotDashboard struct {
+	ID           string    `json:"robot_id"`
+	LastUpdate   time.Time `json:"last_update"`
+	Location     Location  `json:"location"`
+	BatteryLevel float32   `json:"battery_level"`
+	Status       string    `json:"status"`
+}
+
+type ScanOut struct {
+	RobotID   string    `json:"robot_id"`
+	ProductID string    `json:"product_id"`
+	Name      string    `json:"product_name"`
+	Quantity  int       `json:"quantity"`
+	Zone      string    `json:"zone"`
+	Status    string    `json:"status"`
+	ScannedAt time.Time `json:"scanned_at"`
+}
+
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type UserResponse struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+	Role string `json:"role"`
+}
+
+type ctxKey string
+
+const claimsKey ctxKey = "claims"
+
+type Claims struct {
+	UserID int    `json:"user_id"`
+	Role   string `json:"role"`
+	jwt.RegisteredClaims
+}
+
+func authMiddleware(secret []byte, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenStr, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !found || tokenStr == "" {
+			http.Error(w, "missing or invalid authorization header", http.StatusUnauthorized)
+			return
+		}
+
+		claims := &Claims{}
+		token, err := jwt.ParseWithClaims(tokenStr, claims,
+			func(t *jwt.Token) (any, error) { return secret, nil },
+			jwt.WithValidMethods([]string{"HS256"}),
+		)
+		if err != nil || !token.Valid {
+			fmt.Fprintf(os.Stderr, "invalid or expired token: %v\n", err)
+			http.Error(w, "invalid or expired token", http.StatusUnauthorized)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), claimsKey, claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func generateToken(user UserResponse, secret []byte) (string, error) {
+	now := time.Now()
+	claims := Claims{
+		UserID: user.ID,
+		Role:   user.Role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(24 * time.Hour)),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(secret)
+}
+
+func loginHandler(pool *pgxpool.Pool, jwtSecret string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req LoginRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			fmt.Fprintf(os.Stderr, "json error in login: %v\n", err)
+			http.Error(w, "invaild json", http.StatusBadRequest)
+			return
+		}
+
+		if req.Email == "" || req.Password == "" { //TODO: придумать проверку покруче
+			http.Error(w, "email and password are required", http.StatusBadRequest)
+			return
+		}
+
+		var user UserResponse
+		var hash string
+		err := pool.QueryRow(r.Context(),
+			`SELECT id, name, role, password_hash FROM users WHERE email = $1`,
+			req.Email).Scan(&user.ID, &user.Name, &user.Role, &hash)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				http.Error(w, "invalid credentials", http.StatusUnauthorized)
+				return
+			}
+			fmt.Fprintf(os.Stderr, "login query failed: %v\n", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+
+		token, err := generateToken(user, []byte(jwtSecret))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "token generation failed: %v\n", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"token": token, "user": user})
+	}
+}
+
+func generateHashFromPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", fmt.Errorf("generate has error: %v", err)
+	}
+
+	return string(hash), nil
+}
+
+func checkRobotStatus(last_update time.Time, battery_level float32) string {
+	if time.Since(last_update) > 60*time.Second {
+		return "offline"
+	}
+	if battery_level < 20 {
+		return "low_battery"
+	}
+	return "active"
+}
+
+func validateRobotRequest(req RobotRequest) error {
+	if strings.TrimSpace(req.ID) == "" {
+		return errors.New("id is required")
+	}
+
+	if req.BatteryLevel > 100 || req.BatteryLevel < 0 {
+		return errors.New("invalid battery level")
+	}
+
+	if strings.TrimSpace(req.Location.Zone) == "" {
+		return errors.New("zone is required")
+	}
+
+	for _, s := range req.ScanResults {
+		if strings.TrimSpace(s.ID) == "" {
+			return errors.New("product id is required")
+		}
+
+		if s.Quantity < 0 {
+			return errors.New("quantity must be >= 0")
+		}
+	}
+
+	return nil
 }
 
 func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
 		var req RobotRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			fmt.Printf("json decode error: %v", err)
+			fmt.Fprintf(os.Stderr, "json decode error: %v\n", err)
 			http.Error(w, "error json data", http.StatusBadRequest)
+			return
 		}
-		t, err := time.Parse(time.RFC3339, req.Timestamp)
-		if err != nil {
-			t = time.Now() //TODO: придумать что делать, если формат времени не совпадает с нужным
+
+		if err := validateRobotRequest(req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
+
+		if req.LastUpdate.IsZero() {
+			req.LastUpdate = time.Now()
+		}
+		req.LastUpdate = req.LastUpdate.UTC()
+
+		robotStatus := checkRobotStatus(req.LastUpdate, req.BatteryLevel)
 
 		ctx := r.Context()
-		robotStatus := ""
-		if len(req.ScanResults) > 0 {
-			robotStatus = "active"
-		} else {
-			robotStatus = "off"
+		tx, err := pool.Begin(r.Context())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create transaction error: %v\n", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
 		}
+		defer tx.Rollback(r.Context())
 
-		_, err = pool.Exec(ctx, `
-		INSERT INTO robots (id, status, battery_level, last_update, current_zone, current_row, current_shelf) VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (id) DO NOTHING;`, req.ID, robotStatus, req.BatteryLevel, t, req.Location.Zone, req.Location.Row, req.Location.Shelf)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO robots (id, status, battery_level, last_update, current_zone, current_row, current_shelf)
+			VALUES ($1, $2, $3, NOW(), $4, $5, $6)
+			ON CONFLICT (id) DO UPDATE SET
+				status = EXCLUDED.status,
+				battery_level = EXCLUDED.battery_level,
+				last_update = EXCLUDED.last_update,
+				current_zone = EXCLUDED.current_zone,
+				current_row = EXCLUDED.current_row,
+				current_shelf = EXCLUDED.current_shelf`,
+			req.ID, robotStatus, req.BatteryLevel, req.Location.Zone, req.Location.Row, req.Location.Shelf)
 
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "robot insert error: %v\n", err)
@@ -63,7 +251,7 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			return
 		}
 		for _, s := range req.ScanResults {
-			_, err = pool.Exec(ctx, `INSERT INTO products (id, name) VALUES ($1, $2)
+			_, err = tx.Exec(ctx, `INSERT INTO products (id, name) VALUES ($1, $2)
 			ON CONFLICT (id) DO NOTHING`, s.ID, s.Name)
 
 			if err != nil {
@@ -72,16 +260,22 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 				return
 			}
 
-			_, err := pool.Exec(ctx, `
+			_, err := tx.Exec(ctx, `
 			INSERT INTO inventory_history 
 			(robot_id, product_id, quantity, zone, row_number, shelf_number, status, scanned_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-				req.ID, s.ID, s.Quantity, req.Location.Zone, req.Location.Row, req.Location.Shelf, s.Status, t)
+				req.ID, s.ID, s.Quantity, req.Location.Zone, req.Location.Row, req.Location.Shelf, s.Status, req.LastUpdate)
 
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "iventory_history insert error: %v\n", err)
+				fmt.Fprintf(os.Stderr, "inventory_history insert error: %v\n", err)
 				http.Error(w, "db error", http.StatusInternalServerError)
 				return
 			}
+		}
+
+		if err := tx.Commit(r.Context()); err != nil {
+			fmt.Fprintf(os.Stderr, "commit transaction error: %v\n", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
 		}
 
 		w.WriteHeader(http.StatusCreated)
@@ -89,9 +283,103 @@ func robotsDataHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
+func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		scanRows, err := pool.Query(r.Context(), `SELECT h.robot_id, h.product_id, p.name, h.quantity, h.zone, COALESCE(h.status, ''), h.scanned_at
+		FROM inventory_history h JOIN products p ON p.id = h.product_id ORDER BY h.scanned_at DESC LIMIT 20`)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "dashboard select error: %v\n", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		defer scanRows.Close()
+
+		scans := []ScanOut{}
+		for scanRows.Next() {
+			var s ScanOut
+			if err := scanRows.Scan(
+				&s.RobotID,
+				&s.ProductID,
+				&s.Name,
+				&s.Quantity,
+				&s.Zone,
+				&s.Status,
+				&s.ScannedAt); err != nil {
+				fmt.Fprintf(os.Stderr, "history scan error: %v\n", err)
+				http.Error(w, "db error", http.StatusInternalServerError)
+				return
+			}
+			scans = append(scans, s)
+		}
+		//TODO: проверка rows.Err()
+
+		robots := []RobotDashboard{}
+		robotRows, err := pool.Query(r.Context(),
+			`SELECT id, battery_level, last_update, current_zone, current_row, current_shelf 
+			FROM robots`)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "dashboard select error: %v\n", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		defer robotRows.Close()
+
+		for robotRows.Next() {
+			var robot RobotDashboard
+			if err := robotRows.Scan(
+				&robot.ID,
+				&robot.BatteryLevel,
+				&robot.LastUpdate,
+				&robot.Location.Zone,
+				&robot.Location.Row,
+				&robot.Location.Shelf,
+			); err != nil {
+				fmt.Fprintf(os.Stderr, "robot scan error: %v\n", err)
+				http.Error(w, "db error", http.StatusInternalServerError)
+				return
+			}
+			robot.Status = checkRobotStatus(robot.LastUpdate, robot.BatteryLevel)
+			robots = append(robots, robot)
+		}
+		//TODO: проверка rows.Err()
+
+		var scansToday int
+		err = pool.QueryRow(r.Context(),
+			`SELECT COUNT(*) FROM inventory_history WHERE scanned_at >= CURRENT_DATE`,
+		).Scan(&scansToday)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"robots":       robots,
+			"recent_scans": scans,
+			"statistics": map[string]int{ //TODO: расширить статистики
+				"robot_count": len(robots),
+				"scans_count": scansToday,
+			}})
+	}
+}
+
+func newUser(ctx context.Context, pool *pgxpool.Pool) error {
+	name := "ivan"
+	email := "ivan@example.com"
+	password_hash, err := generateHashFromPassword("12345")
+	if err != nil {
+		return fmt.Errorf("generate hash for user: %v", err)
+	}
+	role := "dev"
+
+	if _, err = pool.Exec(ctx, `INSERT INTO users (email, password_hash, name, role) VALUES ($1, $2, $3, $4)`, email, password_hash, name, role); err != nil {
+		return fmt.Errorf("insert new user into db: %v", err)
+	}
+
+	return nil
+}
+
 func main() {
+
 	ctx := context.Background()
 
+	jwtSecret := os.Getenv("JWT_SECRET")
 	connString := fmt.Sprintf("postgres://%v:%v@localhost:5432/%v", os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_PASSWORD"), os.Getenv("POSTGRES_DB"))
 	pool, err := pgxpool.New(ctx, connString)
 	if err != nil {
@@ -106,11 +394,20 @@ func main() {
 		fmt.Println("database connected successfully")
 	}
 
+	if err = newUser(ctx, pool); err != nil {
+		fmt.Fprintf(os.Stderr, "create new user: %v\n", err)
+	} else {
+		fmt.Println("user created successfully")
+	}
+
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "Hello, world!")
 	})
 
 	http.HandleFunc("POST /api/robots/data", robotsDataHandler(pool))
+	http.Handle("GET /api/dashboard/current",
+		authMiddleware([]byte(jwtSecret), http.HandlerFunc(dashboardCurrentHandler(pool))))
+	http.HandleFunc("POST /api/auth/login", loginHandler(pool, jwtSecret))
 
 	http.ListenAndServe("localhost:3030", nil)
 }
