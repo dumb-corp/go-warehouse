@@ -1,0 +1,21 @@
+curl -X POST http://localhost:3030/api/robots/data \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer robot_token_RB-002" \
+  -d '{
+    "robot_id": "RB-001",
+    "timestamp": "2026-11-13T02:03:00Z",
+    "location": {
+      "zone": "A",
+      "row": 1,
+      "shelf": 3
+    },
+    "scan_results": [
+      {
+        "product_id": "as",
+        "product_name": "Роутер RT-AC68U",
+        "quantity": 10,
+        "expected_quantity": 45
+      }
+    ],
+    "battery_level": 10
+  }'

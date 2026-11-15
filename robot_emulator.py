@@ -32,7 +32,7 @@ class RobotEmulator:
             scan_results.append({
                 "product_id": product["id"],
                 "product_name": product["name"],
-                "quantit y": quantity,
+                "quantity": quantity,
                 "status": status
             })
         return scan_results
@@ -65,7 +65,7 @@ class RobotEmulator:
                 "shelf": self.current_shelf
             },
             "scan_results": self.generate_scan_data(),
-            "batter y_level": round(self.battery, 1),
+            "battery_level": round(self.battery, 1),
             "next_checkpoint": f"{self.current_zone}-{self.current_row+1}-{self.current_shelf}"
             }
         try:
@@ -77,7 +77,7 @@ class RobotEmulator:
                     "Content-Type": "application/json"
                 }
             )
-            if response.status_code == 200:
+            if response.status_code == 200 or response.status_code == 201:
                 print(f"[{self.robot_id}] Data sent successfully")
             else:
                 print(f"[{self.robot_id}] Error: {response.status_code}")
@@ -92,7 +92,7 @@ class RobotEmulator:
             time.sleep(int(os.getenv('UPDATE_INTERVAL', 10)))
         
 if __name__ == "__main__":
-    api_url = os.getenv('API_URL', 'http://localhost:8080')
+    api_url = os.getenv('API_URL', 'http://localhost:3030')
     robots_count = int(os.getenv('ROBOTS_COUNT', 5))
     # Запуск эмуляторов роботов
     import threading
