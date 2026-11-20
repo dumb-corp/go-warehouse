@@ -61,7 +61,9 @@ func main() {
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "Hello, world!")
 	})
-
+	// Загрузка CSV
+	http.Handle("POST /api/inventory/import",
+		authMiddleware([]byte(jwtSecret), http.HandlerFunc(importHandler(pool))))
 	// Исторические данные
 	http.Handle("GET /api/inventory/history",
 		authMiddleware([]byte(jwtSecret), http.HandlerFunc(historyHandler(pool))))

@@ -1,7 +1,7 @@
 .PHONY: run up down test build
 
 run:
-	@set -a; . ./dev.env; set +a; go run ./cmd/api
+	@set -a; . ./dev.env; set +a; go run ./cmd/server
 
 up:
 	docker compose up -d

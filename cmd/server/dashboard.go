@@ -11,7 +11,7 @@ import (
 
 func dashboardCurrentHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		scanRows, err := pool.Query(r.Context(), `SELECT h.robot_id, h.product_id, p.name, h.quantity, h.zone, COALESCE(h.status, ''), h.scanned_at
+		scanRows, err := pool.Query(r.Context(), `SELECT COALESCE(h.robot_id, 'csv-import'), h.product_id, p.name, h.quantity, h.zone, COALESCE(h.status, ''), h.scanned_at
 		FROM inventory_history h JOIN products p ON p.id = h.product_id ORDER BY h.scanned_at DESC LIMIT 20`)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "dashboard select error: %v\n", err)

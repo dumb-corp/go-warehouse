@@ -17,7 +17,7 @@ type ScanResult struct {
 }
 
 type ScanOut struct {
-	RobotID   string    `json:"robot_id"`
+	RobotID   *string   `json:"robot_id"`
 	ProductID string    `json:"product_id"`
 	Name      string    `json:"product_name"`
 	Quantity  int       `json:"quantity"`
