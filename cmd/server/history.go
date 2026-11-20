@@ -152,7 +152,7 @@ func historyHandler(pool *pgxpool.Pool) http.HandlerFunc {
 
 		where, args := filter.where()
 
-		itemsQuery := fmt.Sprintf(`SELECT h.robot_id, h.product_id, p.name, h.quantity, h.zone, COALESCE(h.status, ''), h.scanned_at
+		itemsQuery := fmt.Sprintf(`SELECT COALESCE(h.robot_id, 'csv-import'), h.product_id, p.name, h.quantity, h.zone, COALESCE(h.status, ''), h.scanned_at
 		FROM inventory_history h JOIN products p ON p.id = h.product_id %s ORDER BY h.scanned_at DESC, h.id DESC LIMIT %d OFFSET %d`, where, limit, offset)
 
 		historyRows, err := pool.Query(r.Context(), itemsQuery, args...)
