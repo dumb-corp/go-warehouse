@@ -38,7 +38,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	connString := fmt.Sprintf("postgres://%v:%v@localhost:5432/%v", os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_PASSWORD"), os.Getenv("POSTGRES_DB"))
+	connString := fmt.Sprintf("postgres://%v:%v@%v:5432/%v", os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_PASSWORD"), os.Getenv("POSTGRES_HOST"), os.Getenv("POSTGRES_DB"))
 	pool, err := pgxpool.New(ctx, connString)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to connect databse: %v\n", err)
@@ -75,5 +75,5 @@ func main() {
 	// Авторизация
 	http.HandleFunc("POST /api/auth/login", loginHandler(pool, jwtSecret))
 
-	http.ListenAndServe("localhost:3030", nil)
+	http.ListenAndServe(":3030", nil)
 }
