@@ -45,7 +45,7 @@ CREATE TABLE inventory_history (
 -- Прогнозы ИИ
 CREATE TABLE ai_predictions (
     id SERIAL PRIMARY KEY,
-    product_id VARCHAR50) REFERENCES products(id),
+    product_id VARCHAR(50) REFERENCES products(id),
     prediction_date DATE NOT NULL,
     days_until_stockout INTEGER,
     recommended_order INTEGER,
